@@ -2607,11 +2607,7 @@ static void invoke_bpf_mod_ret(struct jit_ctx *ctx, struct bpf_tramp_image *im,
 }
 
 struct arg_aux {
-	/* how many args are passed through registers, the rest of the args are
-	 * passed through stack
-	 */
-	int args_in_regs;
-	/* how many registers are used to pass arguments */
+	/* how many argument slots are passed in registers */
 	int regs_for_args;
 	/* how much stack is used for additional args passed to bpf program
 	 * that did not fit in original function registers
@@ -2622,7 +2618,7 @@ struct arg_aux {
 	 * arguments to be properly aligned)
 	 */
 	int ostack_for_args;
-	/* where AAPCS64 puts each argument slot: an argument register below
+	/* where each argument slot is passed: an argument register below
 	 * the eighth, an on-stack argument slot from it up
 	 */
 	u8 pos_of_slot[MAX_BPF_FUNC_ARG_SLOTS];
@@ -2631,28 +2627,24 @@ struct arg_aux {
 static int calc_arg_aux(const struct btf_func_model *m,
 			 struct arg_aux *a)
 {
-	int slots, i, slot, total;
+	int slot, total;
 
 	total = bpf_jit_place_args(&arm64_arg_abi, m, a->pos_of_slot);
 	if (total > MAX_BPF_FUNC_ARGS)
 		return -ENOTSUPP;
 
-	/* verifier ensures m->nr_args <= MAX_BPF_FUNC_ARGS */
-	for (i = 0, slot = 0; i < m->nr_args; i++) {
-		slots = (m->arg_size[i] + 7) / 8;
-		if (a64_arg_on_stack(a->pos_of_slot[slot])) /* passed through register ? */
+	/*
+	 * Nothing goes back to a register after the stack, so the register
+	 * slots come first. A BPF function's 16-byte argument can straddle
+	 * x7 and the stack.
+	 */
+	for (slot = 0; slot < total; slot++)
+		if (a64_arg_on_stack(a->pos_of_slot[slot]))
 			break;
-		slot += slots;
-	}
 
-	a->args_in_regs = i;
 	a->regs_for_args = slot;
+	a->bstack_for_args = (total - slot) * 8;
 	a->ostack_for_args = 0;
-	a->bstack_for_args = 0;
-
-	/* the rest arguments are passed through stack */
-	for (; i < m->nr_args; i++)
-		a->bstack_for_args += ((m->arg_size[i] + 7) / 8) * 8;
 
 	/* the outgoing area reaches the last slot, over any alignment hole */
 	if (a->bstack_for_args)
@@ -2703,33 +2695,11 @@ static void save_args(struct jit_ctx *ctx, int bargs_off, int oargs_off,
 {
 	u8 tmp = bpf2a64[TMP_REG_1];
 	u8 base_lo = bpf2a64[TMP_REG_2];
-	int i, reg, slot, soff, slots;
+	int i, slot, soff, slots;
 
 	/* only the low 32 bits of the base take part in the subtraction */
 	if (arena_base)
 		emit_a64_mov_i(0, base_lo, (s32)(u32)arena_base, ctx);
-
-	/* store arguments to the stack for the bpf program, or restore
-	 * arguments from stack for the original function
-	 */
-	for (i = 0, slot = 0; i < a->args_in_regs; i++) {
-		bool arena_arg = arena_base && (m->arg_flags[i] & BTF_FMODEL_ARENA_ARG);
-		bool nullable = m->arg_flags[i] & BTF_FMODEL_NULLABLE_ARG;
-
-		slots = (m->arg_size[i] + 7) / 8;
-		while (slots-- > 0) {
-			reg = a->pos_of_slot[slot++];
-			if (for_call_origin) {
-				emit(A64_LDR64I(reg, A64_SP, bargs_off), ctx);
-			} else if (arena_arg) {
-				emit_arena_arg_conv(ctx, tmp, reg, nullable, base_lo);
-				emit(A64_STR64I(tmp, A64_SP, bargs_off), ctx);
-			} else {
-				emit(A64_STR64I(reg, A64_SP, bargs_off), ctx);
-			}
-			bargs_off += 8;
-		}
-	}
 
 	/*
 	 * On-stack arguments start above the frame(s) pushed by the trampoline
@@ -2744,16 +2714,33 @@ static void save_args(struct jit_ctx *ctx, int bargs_off, int oargs_off,
 	 */
 	soff = is_struct_ops ? 16 : 32;
 
-	/* save on stack arguments */
-	for (i = a->args_in_regs; i < m->nr_args; i++) {
+	/* store arguments to the stack for the bpf program, or restore
+	 * arguments from stack for the original function, a slot at a time:
+	 * a BPF function's 16-byte argument can straddle x7 and the stack
+	 */
+	for (i = 0, slot = 0; i < m->nr_args; i++) {
 		bool arena_arg = arena_base && (m->arg_flags[i] & BTF_FMODEL_ARENA_ARG);
 		bool nullable = m->arg_flags[i] & BTF_FMODEL_NULLABLE_ARG;
 
 		slots = (m->arg_size[i] + 7) / 8;
 		/* verifier ensures arg_size <= 16, so slots equals 1 or 2 */
 		while (slots-- > 0) {
-			int off = a64_arg_stack_off(a->pos_of_slot[slot++]);
+			int pos = a->pos_of_slot[slot++], off;
 
+			if (!a64_arg_on_stack(pos)) {
+				if (for_call_origin) {
+					emit(A64_LDR64I(pos, A64_SP, bargs_off), ctx);
+				} else if (arena_arg) {
+					emit_arena_arg_conv(ctx, tmp, pos, nullable, base_lo);
+					emit(A64_STR64I(tmp, A64_SP, bargs_off), ctx);
+				} else {
+					emit(A64_STR64I(pos, A64_SP, bargs_off), ctx);
+				}
+				bargs_off += 8;
+				continue;
+			}
+
+			off = a64_arg_stack_off(pos);
 			emit(A64_LDR64I(tmp, A64_FP, soff + off), ctx);
 			/* if there is unused space in the last slot, clear
 			 * the garbage contained in the space.
